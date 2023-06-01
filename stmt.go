@@ -631,14 +631,13 @@ func (st *statement) queryContextNotLocked(ctx context.Context, args []driver.Na
 		var colCount C.uint32_t
 		f := func() C.int { return C.dpiStmt_execute(st.dpiStmt, mode, &colCount) }
 		for i := 0; i < 3; i++ {
+  		//IT GETS STUCK HERE :)
 			if err = st.checkExec(f); err == nil {
 				break
-			} else {
-				resch <- result{nil, err}
 			}
+
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				resch <- result{nil, ctxErr}
-				return
 			}
 
 			if !isInvalidErr(err) {
@@ -647,7 +646,7 @@ func (st *statement) queryContextNotLocked(ctx context.Context, args []driver.Na
 		}
 
 		if err != nil {
-			resch <- result{nil, closeIfBadConn(fmt.Errorf("dpiStmt_execute: %w", err))}
+			resch <- result{nil, err}
 			return
 		}
 
@@ -657,7 +656,10 @@ func (st *statement) queryContextNotLocked(ctx context.Context, args []driver.Na
 
 	select {
 	case r := <-resch:
-		return r.rows, r.err
+		if r.err != nil {
+			return nil, closeIfBadConn(fmt.Errorf("dpiStmt_execute: %w", r.err))
+		}
+		return r.rows, nil
 	case <-done:
 		return nil, closeIfBadConn(context.DeadlineExceeded)
 	case <-ctx.Done():
