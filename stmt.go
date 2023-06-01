@@ -21,6 +21,7 @@ void godror_setFromString(dpiVar *dv, uint32_t pos, const _GoString_ value) {
 }
 */
 import "C"
+
 import (
 	"bytes"
 	"context"
@@ -75,12 +76,14 @@ func (bs boolString) MaxLen() int {
 	}
 	return n
 }
+
 func (bs boolString) ToString(b bool) string {
 	if b {
 		return bs.True
 	}
 	return bs.False
 }
+
 func (bs boolString) FromString(s string) bool {
 	return s == bs.True && bs.True != "" || bs.True == "" && s != bs.False
 }
@@ -102,6 +105,7 @@ func (o stmtOptions) ArraySize() int {
 	}
 	return o.arraySize
 }
+
 func (o stmtOptions) PrefetchCount() int {
 	switch n := o.prefetchCount; {
 	case n == 0:
@@ -112,6 +116,7 @@ func (o stmtOptions) PrefetchCount() int {
 		return n
 	}
 }
+
 func (o stmtOptions) FetchArraySize() int {
 	n := o.fetchArraySize
 	if n <= 0 {
@@ -282,10 +287,12 @@ func NumberAsFloat64() Option { return func(o *stmtOptions) { o.numberAsFloat64 
 
 const minChunkSize = 1 << 16
 
-var _ driver.Stmt = (*statement)(nil)
-var _ driver.StmtQueryContext = (*statement)(nil)
-var _ driver.StmtExecContext = (*statement)(nil)
-var _ driver.NamedValueChecker = (*statement)(nil)
+var (
+	_ driver.Stmt              = (*statement)(nil)
+	_ driver.StmtQueryContext  = (*statement)(nil)
+	_ driver.StmtExecContext   = (*statement)(nil)
+	_ driver.NamedValueChecker = (*statement)(nil)
+)
 
 type statement struct {
 	ctx context.Context
@@ -319,6 +326,7 @@ func (st *statement) Close() error {
 
 	return st.closeNotLocking()
 }
+
 func (st *statement) closeNotLocking() error {
 	if st == nil || st.dpiStmt == nil {
 		return nil
@@ -446,7 +454,7 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 	}
 
 	mode := st.ExecMode()
-	//fmt.Printf("%p.%p: inTran? %t\n%s\n", st.conn, st, st.inTransaction, st.query)
+	// fmt.Printf("%p.%p: inTran? %t\n%s\n", st.conn, st, st.inTransaction, st.query)
 	if !st.inTransaction {
 		mode |= C.DPI_MODE_EXEC_COMMIT_ON_SUCCESS
 	}
@@ -476,7 +484,7 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 		}
 	}
 	if err != nil {
-		return nil, closeIfBadConn(err) //fmt.Errorf("dpiStmt_execute(mode=%d arrLen=%d): %w", mode, arrLen, err))
+		return nil, closeIfBadConn(err) // fmt.Errorf("dpiStmt_execute(mode=%d arrLen=%d): %w", mode, arrLen, err))
 	}
 
 	if logger != nil {
@@ -519,7 +527,7 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 			}
 			return nil, closeIfBadConn(fmt.Errorf("%d.getNumElementsInArray: %w", i, err))
 		}
-		//fmt.Printf("i=%d dest=%T %#v\n", i, dest, dest)
+		// fmt.Printf("i=%d dest=%T %#v\n", i, dest, dest)
 		if err := get(dest, st.data[i][:n]); err != nil {
 			if logger != nil {
 				logger.Log("msg", "get", "i", i, "n", n, "error", err)
@@ -597,14 +605,14 @@ func (st *statement) queryContextNotLocked(ctx context.Context, args []driver.Na
 	}
 	// HandleDeadline for all ODPI calls called below
 
-	//fmt.Printf("QueryContext(%+v)\n", args)
+	// fmt.Printf("QueryContext(%+v)\n", args)
 	// bind variables
 	if err = st.bindVars(args, logger); err != nil {
 		return nil, closeIfBadConn(err)
 	}
 
 	mode := st.ExecMode()
-	//fmt.Printf("%p.%p: inTran? %t\n%s\n", st.conn, st, st.inTransaction, st.query)
+	// fmt.Printf("%p.%p: inTran? %t\n%s\n", st.conn, st, st.inTransaction, st.query)
 	if !st.inTransaction {
 		mode |= C.DPI_MODE_EXEC_COMMIT_ON_SUCCESS
 	}
@@ -612,26 +620,54 @@ func (st *statement) queryContextNotLocked(ctx context.Context, args []driver.Na
 	C.dpiStmt_setFetchArraySize(st.dpiStmt, C.uint32_t(st.FetchArraySize()))
 	C.dpiStmt_setPrefetchRows(st.dpiStmt, C.uint32_t(st.PrefetchCount()))
 
-	// execute
-	var colCount C.uint32_t
-	f := func() C.int { return C.dpiStmt_execute(st.dpiStmt, mode, &colCount) }
-	for i := 0; i < 3; i++ {
-		if err = st.checkExec(f); err == nil {
-			break
-		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		if !isInvalidErr(err) {
-			break
-		}
-	}
-	if err != nil {
-		return nil, closeIfBadConn(fmt.Errorf("dpiStmt_execute: %w", err))
+	type result struct {
+		rows driver.Rows
+		err  error
 	}
 
-	rows, err := st.openRows(int(colCount))
-	return rows, closeIfBadConn(err)
+	resch := make(chan result)
+
+	go func() {
+		var colCount C.uint32_t
+		f := func() C.int { return C.dpiStmt_execute(st.dpiStmt, mode, &colCount) }
+		for i := 0; i < 3; i++ {
+			if err = st.checkExec(f); err == nil {
+				break
+			} else {
+				resch <- result{nil, err}
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				resch <- result{nil, ctxErr}
+				return
+			}
+
+			if !isInvalidErr(err) {
+				break
+			}
+		}
+
+		if err != nil {
+			resch <- result{nil, closeIfBadConn(fmt.Errorf("dpiStmt_execute: %w", err))}
+			return
+		}
+
+		rows, err := st.openRows(int(colCount))
+		resch <- result{rows, err}
+	}()
+
+	select {
+	case r := <-resch:
+		return r.rows, r.err
+	case <-done:
+		return nil, closeIfBadConn(context.DeadlineExceeded)
+	case <-ctx.Done():
+		select {
+		case <-done:
+			return nil, closeIfBadConn(ctx.Err())
+		default:
+			return nil, closeIfBadConn(ctx.Err())
+		}
+	}
 }
 
 // NumInput returns the number of placeholder parameters.
@@ -769,7 +805,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger Logger) error {
 	maxArraySize := st.ArraySize()
 
 	infos := make([]argInfo, len(args))
-	//fmt.Printf("bindVars %d\n", len(args))
+	// fmt.Printf("bindVars %d\n", len(args))
 	for i, a := range args {
 		st.gets[i] = nil
 		st.dests[i] = nil
@@ -867,7 +903,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger Logger) error {
 		if logger != nil {
 			logger.Log("msg", "newVar", "i", i, "plSQLArrays", st.PlSQLArrays(), "typ", int(info.typ), "natTyp", int(info.natTyp), "sliceLen", n, "bufSize", info.bufSize, "isSlice", st.isSlice[i])
 		}
-		//i, st.PlSQLArrays(), info.typ, info.natTyp dataSliceLen, info.bufSize)
+		// i, st.PlSQLArrays(), info.typ, info.natTyp dataSliceLen, info.bufSize)
 		vi := varInfo{
 			IsPLSArray: st.PlSQLArrays() && st.isSlice[i],
 			Typ:        info.typ, NatTyp: info.natTyp,
@@ -923,7 +959,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger Logger) error {
 				return fmt.Errorf("%+v.setNumElementsInArray[%d](%d): %w", dv, i, n, err)
 			}
 		}
-		//fmt.Println("n:", len(st.data[i]))
+		// fmt.Println("n:", len(st.data[i]))
 		if err := info.set(dv, data, value); err != nil {
 			return err
 		}
@@ -943,7 +979,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger Logger) error {
 		if name == "" {
 			name = strconv.Itoa(a.Ordinal)
 		}
-		//fmt.Printf("bindByName(%q)\n", name)
+		// fmt.Printf("bindByName(%q)\n", name)
 		cName := C.CString(name)
 		err := st.checkExecNoLOT(func() C.int { return C.dpiStmt_bindByName(st.dpiStmt, cName, C.uint32_t(len(name)), st.vars[i]) })
 		C.free(unsafe.Pointer(cName))
@@ -1299,6 +1335,7 @@ func dataSetNull(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	}
 	return nil
 }
+
 func dataGetBool(v interface{}, data []C.dpiData) error {
 	if b, ok := v.(*bool); ok {
 		if len(data) == 0 || data[0].isNull == 1 {
@@ -1325,6 +1362,7 @@ func dataGetBool(v interface{}, data []C.dpiData) error {
 	}
 	return nil
 }
+
 func dataSetBool(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	if vv == nil {
 		return dataSetNull(dv, data, nil)
@@ -1436,7 +1474,7 @@ func (c *conn) dataGetTimeC(t *time.Time, data *C.dpiData) {
 		*t = time.Time{}
 		return
 	}
-	//ts := C.dpiData_getTimestamp(data)
+	// ts := C.dpiData_getTimestamp(data)
 	ts := *((*C.dpiTimestamp)(unsafe.Pointer(&data.value)))
 	*t = time.Date(
 		int(ts.year), time.Month(ts.month), int(ts.day),
@@ -1496,7 +1534,7 @@ func (c *conn) dataSetTime(dv *C.dpiVar, data []C.dpiData, vv interface{}) error
 		return fmt.Errorf("dataSetTime(%T): %w", vv, errUnknownType)
 	}
 
-	//tzHour, tzMin := C.int8_t(c.tzOffSecs/3600), C.int8_t((c.tzOffSecs%3600)/60)
+	// tzHour, tzMin := C.int8_t(c.tzOffSecs/3600), C.int8_t((c.tzOffSecs%3600)/60)
 	if logger == nil {
 		logger = getLogger(context.TODO())
 	}
@@ -1565,7 +1603,7 @@ func (c *conn) dataGetIntervalDS(v interface{}, data []C.dpiData) error {
 }
 
 func dataGetIntervalDS(t *time.Duration, d *C.dpiData) {
-	//ds := C.dpiData_getIntervalDS(d)
+	// ds := C.dpiData_getIntervalDS(d)
 	ds := *((*C.dpiIntervalDS)(unsafe.Pointer(&d.value)))
 	*t = time.Duration(ds.days)*24*time.Hour +
 		time.Duration(ds.hours)*time.Hour +
@@ -1719,7 +1757,7 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 		if len(data) == 0 || data[0].isNull == 1 {
 			x.Valid = false
 		} else {
-			//x.Valid, x.Int32 = true, int32(C.dpiData_getInt64(&data[0]))
+			// x.Valid, x.Int32 = true, int32(C.dpiData_getInt64(&data[0]))
 			x.Valid, x.Int32 = true, *((*int32)(unsafe.Pointer(&data[0].value)))
 		}
 	case *[]sql.NullInt32:
@@ -1728,16 +1766,18 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 			if data[i].isNull == 1 {
 				*x = append(*x, sql.NullInt32{Valid: false})
 			} else {
-				*x = append(*x, sql.NullInt32{Valid: true,
-					//Int32: int32(C.dpiData_getInt64(&data[i]))})
-					Int32: *((*int32)(unsafe.Pointer(&data[i].value)))})
+				*x = append(*x, sql.NullInt32{
+					Valid: true,
+					// Int32: int32(C.dpiData_getInt64(&data[i]))})
+					Int32: *((*int32)(unsafe.Pointer(&data[i].value))),
+				})
 			}
 		}
 	case *sql.NullInt64:
 		if len(data) == 0 || data[0].isNull == 1 {
 			x.Valid = false
 		} else {
-			//x.Valid, x.Int64 = true, int64(C.dpiData_getInt64(&data[0]))
+			// x.Valid, x.Int64 = true, int64(C.dpiData_getInt64(&data[0]))
 			x.Valid, x.Int64 = true, *((*int64)(unsafe.Pointer(&data[0].value)))
 		}
 	case *[]sql.NullInt64:
@@ -1746,16 +1786,18 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 			if data[i].isNull == 1 {
 				*x = append(*x, sql.NullInt64{Valid: false})
 			} else {
-				*x = append(*x, sql.NullInt64{Valid: true,
-					//Int64: int64(C.dpiData_getInt64(&data[i]))})
-					Int64: *((*int64)(unsafe.Pointer(&data[i].value)))})
+				*x = append(*x, sql.NullInt64{
+					Valid: true,
+					// Int64: int64(C.dpiData_getInt64(&data[i]))})
+					Int64: *((*int64)(unsafe.Pointer(&data[i].value))),
+				})
 			}
 		}
 	case *sql.NullFloat64:
 		if len(data) == 0 || data[0].isNull == 1 {
 			x.Valid = false
 		} else {
-			//x.Valid, x.Float64 = true, float64(C.dpiData_getDouble(&data[0]))
+			// x.Valid, x.Float64 = true, float64(C.dpiData_getDouble(&data[0]))
 			x.Valid, x.Float64 = true, *((*float64)(unsafe.Pointer(&data[0].value)))
 		}
 	case *[]sql.NullFloat64:
@@ -1764,9 +1806,11 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 			if data[i].isNull == 1 {
 				*x = append(*x, sql.NullFloat64{Valid: false})
 			} else {
-				*x = append(*x, sql.NullFloat64{Valid: true,
-					//Float64: float64(C.dpiData_getDouble(&data[i]))})
-					Float64: *((*float64)(unsafe.Pointer(&data[i].value)))})
+				*x = append(*x, sql.NullFloat64{
+					Valid: true,
+					// Float64: float64(C.dpiData_getDouble(&data[i]))})
+					Float64: *((*float64)(unsafe.Pointer(&data[i].value))),
+				})
 			}
 		}
 
@@ -1898,7 +1942,7 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 		return fmt.Errorf("unknown number [%T] %#v", v, v)
 	}
 
-	//fmt.Printf("setInt64(%#v, %#v)\n", data, C.int64_t(int64(v.(int))))
+	// fmt.Printf("setInt64(%#v, %#v)\n", data, C.int64_t(int64(v.(int))))
 	return nil
 }
 
@@ -2055,7 +2099,7 @@ func dataSetNumber(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 		return fmt.Errorf("unknown number slice [%T] %#v", vv, vv)
 	}
 
-	//fmt.Printf("setInt64(%#v, %#v)\n", data, C.int64_t(int64(v.(int))))
+	// fmt.Printf("setInt64(%#v, %#v)\n", data, C.int64_t(int64(v.(int))))
 	return nil
 }
 
@@ -2262,7 +2306,7 @@ func dataSetBytes(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 		}
 		data[i].isNull = 0
 		p = (*C.char)(unsafe.Pointer(&x[0]))
-		//if logger != nil {Log("C", "dpiVar_setFromBytes", "dv", dv, "pos", pos, "p", p, "len", len(x)) }
+		// if logger != nil {Log("C", "dpiVar_setFromBytes", "dv", dv, "pos", pos, "p", p, "len", len(x)) }
 		C.dpiVar_setFromBytes(dv, C.uint32_t(i), p, C.uint32_t(len(x)))
 	case [][]byte:
 		for i, x := range slice {
@@ -2272,7 +2316,7 @@ func dataSetBytes(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 			}
 			data[i].isNull = 0
 			p = (*C.char)(unsafe.Pointer(&x[0]))
-			//if logger != nil {Log("C", "dpiVar_setFromBytes", "dv", dv, "pos", pos, "p", p, "len", len(x)) }
+			// if logger != nil {Log("C", "dpiVar_setFromBytes", "dv", dv, "pos", pos, "p", p, "len", len(x)) }
 			C.dpiVar_setFromBytes(dv, C.uint32_t(i), p, C.uint32_t(len(x)))
 		}
 
@@ -2384,6 +2428,7 @@ func (st *statement) dataGetBoolBytes(v interface{}, data []C.dpiData) error {
 	}
 	return nil
 }
+
 func (st *statement) dataSetBoolBytes(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	if len(data) == 0 {
 		return nil
@@ -2441,7 +2486,8 @@ func (st *statement) dataGetStmtC(row *driver.Rows, data *C.dpiData) error {
 		*row = nil
 		return nil
 	}
-	st2 := &statement{conn: st.conn, dpiStmt: C.dpiData_getStmt(data),
+	st2 := &statement{
+		conn: st.conn, dpiStmt: C.dpiData_getStmt(data),
 		stmtOptions: st.stmtOptions, // inherit parent statement's options
 	}
 
@@ -2490,6 +2536,7 @@ func (c *conn) dataGetLOB(v interface{}, data []C.dpiData) error {
 	}
 	return nil
 }
+
 func (c *conn) dataGetLOBC(L *Lob, data *C.dpiData) {
 	L.Reader = nil
 	if data.isNull == 1 {
@@ -2526,6 +2573,7 @@ func (c *conn) dataSetLOB(dv *C.dpiVar, data []C.dpiData, vv interface{}) error 
 	}
 	return firstErr
 }
+
 func (c *conn) dataSetLOBOne(dv *C.dpiVar, data []C.dpiData, i int, L Lob) error {
 	if L.Reader == nil {
 		data[i].isNull = 1
@@ -2622,7 +2670,7 @@ type ObjectWriter interface {
 }
 
 func (c *conn) dataSetObject(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
-	//fmt.Printf("\ndataSetObject(dv=%+v, data=%+v, vv=%+v)\n", dv, data, vv)
+	// fmt.Printf("\ndataSetObject(dv=%+v, data=%+v, vv=%+v)\n", dv, data, vv)
 	if len(data) == 0 {
 		return nil
 	}
@@ -2846,6 +2894,7 @@ func (c *conn) dataSetObjectStruct(ot *ObjectType, dv *C.dpiVar, data *C.dpiData
 	}
 	return obj.Close()
 }
+
 func (c *conn) dataGetObject(v interface{}, data []C.dpiData) error {
 	logger := getLogger(context.TODO())
 	switch out := v.(type) {
@@ -3189,7 +3238,6 @@ func fieldIsObjectTypeName(f reflect.StructField) bool {
 }
 
 func (c *conn) dataGetJSON(v interface{}, data []C.dpiData) error {
-
 	switch out := v.(type) {
 	case *JSON:
 		*out = JSON{dpiJson: *((**C.dpiJson)(unsafe.Pointer(&(data[0].value))))}
@@ -3337,7 +3385,6 @@ func (c *conn) dataSetJSONString(dv *C.dpiVar, data []C.dpiData, vv interface{})
 }
 
 func (c *conn) dataGetJSONString(v interface{}, data []C.dpiData) error {
-
 	switch out := v.(type) {
 	case *string:
 		js := JSON{dpiJson: (*(**C.dpiJson)(unsafe.Pointer(&(data[0].value))))}
@@ -3389,7 +3436,7 @@ func (st *statement) ColumnConverter(idx int) driver.ValueConverter {
 		switch col.NativeType {
 		case C.DPI_NATIVE_TYPE_INT64, C.DPI_NATIVE_TYPE_UINT64:
 			c = Int64
-		//case C.DPI_NATIVE_TYPE_FLOAT, C.DPI_NATIVE_TYPE_DOUBLE:
+		// case C.DPI_NATIVE_TYPE_FLOAT, C.DPI_NATIVE_TYPE_DOUBLE:
 		//	c = Float64
 		default:
 			c = Num
@@ -3429,7 +3476,7 @@ func (st *statement) openRows(colCount int) (*rows, error) {
 		if logger != nil {
 			logger.Log("msg", "openRows", "col", i, "info", ti)
 		}
-		//if logger != nil {Log("dNTN", int(ti.defaultNativeTypeNum), "number", C.DPI_ORACLE_TYPE_NUMBER) }
+		// if logger != nil {Log("dNTN", int(ti.defaultNativeTypeNum), "number", C.DPI_ORACLE_TYPE_NUMBER) }
 		effTypeNum := ti.oracleTypeNum
 		switch effTypeNum {
 		case C.DPI_ORACLE_TYPE_NUMBER:
@@ -3467,7 +3514,7 @@ func (st *statement) openRows(colCount int) (*rows, error) {
 			DBSize:         ti.dbSizeInBytes,
 		}
 		var err error
-		//fmt.Printf("%d. %+v\n", i, r.columns[i])
+		// fmt.Printf("%d. %+v\n", i, r.columns[i])
 		vi := varInfo{
 			Typ:        effTypeNum,
 			NatTyp:     ti.defaultNativeTypeNum,
@@ -3521,6 +3568,7 @@ type stringBuilderPool struct {
 func (sb stringBuilderPool) Get() *strings.Builder {
 	return sb.p.Get().(*strings.Builder)
 }
+
 func (sb *stringBuilderPool) Put(b *strings.Builder) {
 	b.Reset()
 	sb.p.Put(b)
